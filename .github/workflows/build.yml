@@ -1,0 +1,79 @@
+name: Build LiveContainer (Touch Fix)
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & release IPA (ad-hoc signed)
+    runs-on: macos-15
+    env:
+      scheme: LiveContainer
+      archive_path: archive
+    steps:
+      # 原 IPA 由 Xcode 26.2 / iOS 26.2 SDK 构建；macos-15 镜像预装 26.3。
+      - name: Select Xcode 26.3
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.3'
+
+      - name: Checkout meta (patch)
+        uses: actions/checkout@v4
+        with:
+          path: meta
+
+      # 官方源码，固定在补丁所基于的 commit，含子模块（OpenSSL / litehook）。
+      - name: Checkout official source @ b7cfda6
+        uses: actions/checkout@v4
+        with:
+          repository: LiveContainer/LiveContainer
+          ref: b7cfda6
+          submodules: recursive
+
+      - name: Apply touch-fix patch
+        run: |
+          git apply meta/livecontainer-touch-fix.patch
+          test -f LiveContainer/LCSceneUtils.h && echo "touch-fix applied OK"
+
+      - name: Ensure wget
+        run: command -v wget >/dev/null 2>&1 || brew install wget
+
+      - name: Install xcpretty
+        run: gem install xcpretty --no-document
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      # 公开 runner 无开发者证书：archive 跳过签名，最终由 ldid ad-hoc 签名。
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -archivePath "$archive_path" \
+            -scheme "$scheme" \
+            -project LiveContainer.xcodeproj \
+            -sdk iphoneos \
+            -arch arm64 \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO | xcpretty
+
+      # 官方打包脚本：注入 SideStore scheme/app group，dylibify SideStore，ldid 签名。
+      - name: Create IPA
+        run: sh .github/build_github.sh
+
+      - name: List artifacts
+        run: ls -lh *.ipa
+
+      - name: Publish IPAs to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: touchfix-${{ github.run_id }}
+          name: "LiveContainer TouchFix IPA"
+          body: "官方 3.8.14 (b7cfda6) + 多实例触摸修复。ad-hoc 签名，请用 SideStore/AltStore/Sideloadly 侧载安装。主 LiveContainer 与 LiveContainer2 需使用同一 IPA 重签。"
+          files: |
+            LiveContainer.ipa
+            LiveContainer+SideStore.ipa
