@@ -28,12 +28,10 @@ jobs:
 
       # 官方源码，固定在补丁所基于的 commit，含子模块（OpenSSL / litehook）。
       - name: Checkout official source @ b7cfda6
-        uses: actions/checkout@v4
-        with:
-          repository: LiveContainer/LiveContainer
-          ref: b7cfda6
-          fetch-depth: 0
-          submodules: recursive
+        run: |
+          git clone --filter=blob:none https://github.com/LiveContainer/LiveContainer.git .
+          git checkout b7cfda60c39933a94d616f2a358ac2e48fd4e5cd
+          git submodule update --init --recursive
 
       - name: Apply touch-fix patch
         run: |
