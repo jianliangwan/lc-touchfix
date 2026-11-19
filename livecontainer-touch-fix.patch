@@ -1,0 +1,395 @@
+diff --git a/LiveContainer/LCBootstrap.m b/LiveContainer/LCBootstrap.m
+index 254d424..f2dc0c8 100644
+--- a/LiveContainer/LCBootstrap.m
++++ b/LiveContainer/LCBootstrap.m
+@@ -836,16 +836,24 @@ int LiveContainerMain(int argc, char *argv[]) {
+         selectedContainer = [LCSharedUtils findDefaultContainerWithBundleId:selectedApp];
+     }
+     NSString* runningLC = [LCSharedUtils getContainerUsingLCSchemeWithFolderName:selectedContainer];
++    // `runningLC` is `livecontainerN` for a classic guest, or `liveprocess` /
++    // `livecontainerN.liveprocess` for a multitask guest hosted by LiveProcess.
++    // - Only a dotted form names a jumpable LC instance (strip the suffix).
++    // - A bare `liveprocess` is NOT a jump target: the original code left it
++    //   unchanged, built an invalid `liveprocess://` URL, then (because it had
++    //   already cleared selectedApp) launched nothing at all. Treat it as "no
++    //   other instance" and fall through to launch locally, matching the
++    //   documented "if running lc is liveprocess we just continue" intent.
++    if([runningLC hasSuffix:@".liveprocess"]) {
++        runningLC = runningLC.stringByDeletingPathExtension;
++    } else if([runningLC isEqualToString:@"liveprocess"]) {
++        runningLC = nil;
++    }
+     // if another instance is running, we just switch to that one, these should be called after uiapplication initialized
+-    // however if the running lc is liveprocess and current lc is livecontainer1 we just continue
+     if(selectedApp && runningLC) {
+         [lcUserDefaults removeObjectForKey:@"selected"];
+         [lcUserDefaults removeObjectForKey:@"selectedContainer"];
+-        
+-        if([runningLC hasSuffix:@"liveprocess"]) {
+-            runningLC = runningLC.stringByDeletingPathExtension;
+-        }
+-        
++
+         NSString* selectedAppBackUp = selectedApp;
+         selectedApp = nil;
+         dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC));
+diff --git a/LiveContainer/LCSceneUtils.h b/LiveContainer/LCSceneUtils.h
+new file mode 100644
+index 0000000..56b61c2
+--- /dev/null
++++ b/LiveContainer/LCSceneUtils.h
+@@ -0,0 +1,105 @@
++//
++//  LCSceneUtils.h
++//  LiveContainer
++//
++//  Helpers to resolve the *correct* foreground UIWindowScene / key window.
++//
++//  Why this exists:
++//  LiveContainer hosts more than one app scene inside a single process
++//  (multitask virtual/native windows) and also runs multiple LC instances.
++//  On iPhone and single-screen iPads every UIWindowScene shares
++//  UIScreen.mainScreen, so resolving a scene by `connectedScenes.anyObject`,
++//  `.first` or by matching `windowScene.screen == self.screen` picks an
++//  ARBITRARY scene. A guest window / alert window bound to a background or
++//  terminated scene becomes invisible-but-present and swallows every touch,
++//  which is exactly the "app shows but cannot be touched" symptom.
++//
++//  These helpers always prefer the scene the user is actually looking at
++//  (foregroundActive), then a foreground-inactive scene, and only fall back
++//  to a stable, explicit choice. They never use `anyObject` for touch-bearing
++//  windows.
++//
++
++#import <UIKit/UIKit.h>
++
++NS_ASSUME_NONNULL_BEGIN
++
++/// The scene the user is currently interacting with. Best choice for any
++/// window that must receive touches (guest windows, confirmation alerts).
++/// - Returns: foregroundActive scene, else foregroundInactive scene, else nil.
++static inline UIWindowScene * _Nullable LCForegroundActiveScene(void) {
++    UIApplication *app = UIApplication.sharedApplication;
++    UIWindowScene *foregroundInactive = nil;
++
++    for (id object in app.connectedScenes) {
++        if (![object isKindOfClass:UIWindowScene.class]) continue;
++        UIWindowScene *scene = (UIWindowScene *)object;
++        if (scene.activationState == UISceneActivationStateForegroundActive) {
++            return scene;
++        }
++        if (!foregroundInactive && scene.activationState == UISceneActivationStateForegroundInactive) {
++            foregroundInactive = scene;
++        }
++    }
++    return foregroundInactive;
++}
++
++/// The key window of the foreground-active scene. Use this instead of
++/// `connectedScenes.anyObject.keyWindow`, which can be a totally different
++/// (background) scene's window on a multi-scene process.
++/// - Returns: key window belonging to the active scene, else nil.
++static inline UIWindow * _Nullable LCActiveSceneKeyWindow(void) {
++    UIWindowScene *scene = LCForegroundActiveScene();
++    if (!scene) return nil;
++    for (UIWindow *window in scene.windows) {
++        if (window.isKeyWindow && !window.hidden) return window;
++    }
++    return nil;
++}
++
++/// Bind `window` to the scene the user is currently looking at. If there is no
++/// active scene yet (very early launch), the window is left unbound and UIKit
++/// will associate it with the scene it is presented from.
++static inline void LCBindWindowToActiveScene(UIWindow *window) {
++    UIWindowScene *scene = LCForegroundActiveScene();
++    if (scene && window.windowScene != scene) {
++        window.windowScene = scene;
++    }
++}
++
++/// Given a `runningLC` value from containerLock.plist, resolve the actual LC
++/// instance URL scheme to jump to.
++///
++/// containerLock stores `lcAppUrlScheme`, which for a multitask guest hosted by
++/// LiveProcess is the bare string `@"liveprocess"` (NOT e.g. `livecontainer2`).
++/// `-stringByDeletingPathExtension` on a bare `@"liveprocess"` is a no-op, so
++/// callers ended up opening `liveprocess://...`, which no installed LC handles.
++/// The host LC scheme lives in the host main bundle's CFBundleURLSchemes; pick
++/// the one matching the `livecontainer*` family.
++static inline NSString * _Nullable LCResolveHostLCScheme(NSString * _Nullable runningLC,
++                                                          NSBundle * _Nullable hostBundle) {
++    if (!runningLC) return nil;
++
++    if (![runningLC hasSuffix:@"liveprocess"]) {
++        return runningLC;
++    }
++
++    // `livecontainer2.liveprocess` -> `livecontainer2` (legitimate dotted form).
++    NSString *stripped = runningLC.stringByDeletingPathExtension;
++    if (![stripped isEqualToString:runningLC] && stripped.length > 0) {
++        return stripped;
++    }
++
++    // Bare `liveprocess`: recover the host app's own scheme.
++    NSArray *urlTypes = hostBundle.infoDictionary[@"CFBundleURLTypes"];
++    for (NSDictionary *type in urlTypes) {
++        for (NSString *scheme in type[@"CFBundleURLSchemes"]) {
++            if ([scheme hasPrefix:@"livecontainer"] && ![scheme hasSuffix:@"liveprocess"]) {
++                return scheme;
++            }
++        }
++    }
++    return nil;
++}
++
++NS_ASSUME_NONNULL_END
+diff --git a/LiveContainerSwiftUI/Utilities/LCUtils.m b/LiveContainerSwiftUI/Utilities/LCUtils.m
+index c6630f1..76b66c9 100644
+--- a/LiveContainerSwiftUI/Utilities/LCUtils.m
++++ b/LiveContainerSwiftUI/Utilities/LCUtils.m
+@@ -7,6 +7,7 @@
+ 
+ #import "LCUtils.h"
+ #import "../../LiveContainer/LCSharedUtils.h"
++#import "../../LiveContainer/LCSceneUtils.h"
+ #import "LCAppInfo.h"
+ #import "../../MultitaskSupport/DecoratedAppSceneViewController.h"
+ #import "../../ZSign/zsigner.h"
+@@ -79,7 +80,15 @@
+             }
+         }
+         
+-        UIViewController *rootVC = ((UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject).keyWindow.rootViewController;
++        // Take the root view controller from the foreground-active scene's key
++        // window. `connectedScenes.anyObject` can be a background multitask scene
++        // whose window is not the one the user is interacting with.
++        UIWindowScene *activeScene = LCForegroundActiveScene();
++        UIWindow *keyWindow = nil;
++        for (UIWindow *window in activeScene.windows) {
++            if (window.isKeyWindow && !window.hidden) { keyWindow = window; break; }
++        }
++        UIViewController *rootVC = keyWindow.rootViewController ?: UIApplication.sharedApplication.windows.firstObject.rootViewController;
+         DecoratedAppSceneViewController *launcherView = [[DecoratedAppSceneViewController alloc] initWindowName:displayName bundleId:bundleId dataUUID:dataUUID rootVC:rootVC];
+         // Wire PID callback
+         launcherView.pidAvailableHandler = completionHandler;
+diff --git a/MultitaskSupport/VirtualWindowsHostView.m b/MultitaskSupport/VirtualWindowsHostView.m
+index 841bb42..058a629 100644
+--- a/MultitaskSupport/VirtualWindowsHostView.m
++++ b/MultitaskSupport/VirtualWindowsHostView.m
+@@ -6,10 +6,15 @@
+ //
+ #import "DecoratedAppSceneViewController.h"
+ #import "VirtualWindowsHostView.h"
++#import "../LiveContainer/LCSceneUtils.h"
+ 
+ @implementation VirtualWindowsHostView
+ - (instancetype)init {
+-    CGRect frame = ((UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject).keyWindow.bounds;
++    // Use the foreground-active scene's key window (falling back to the main
++    // screen) instead of an arbitrary scene, which in a multi-scene process can
++    // be a background/terminated scene with a stale or zero bounds.
++    UIWindow *keyWindow = LCActiveSceneKeyWindow();
++    CGRect frame = keyWindow ? keyWindow.bounds : UIScreen.mainScreen.bounds;
+     self = [super initWithFrame:frame];
+     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+     self.shouldForwardTapAction = YES;
+diff --git a/TweakLoader/TweakLoader.m b/TweakLoader/TweakLoader.m
+index 6a1655a..80d6a53 100644
+--- a/TweakLoader/TweakLoader.m
++++ b/TweakLoader/TweakLoader.m
+@@ -3,6 +3,7 @@
+ #include <dlfcn.h>
+ #include <objc/runtime.h>
+ #import "../LiveContainer/utils.h"
++#import "../LiveContainer/LCSceneUtils.h"
+ 
+ static NSString *loadTweakAtURL(NSURL *url) {
+     NSString *tweakPath = url.path;
+@@ -69,8 +70,8 @@ static void showDlerrAlert(NSString *error) {
+     }];
+     [alert addAction:cancelAction];
+     window.rootViewController = [UIViewController new];
+-    window.windowLevel = 1000;
+-    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
++    LCBindWindowToActiveScene(window);
++    window.windowLevel = UIWindowLevelAlert;
+     [window makeKeyAndVisible];
+     [window.rootViewController presentViewController:alert animated:YES completion:nil];
+     objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+diff --git a/TweakLoader/UIKit+GuestHooks.m b/TweakLoader/UIKit+GuestHooks.m
+index 2abc86f..c5f43a7 100644
+--- a/TweakLoader/UIKit+GuestHooks.m
++++ b/TweakLoader/UIKit+GuestHooks.m
+@@ -2,6 +2,7 @@
+ #import "LCSharedUtils.h"
+ #import "UIKitPrivate.h"
+ #import "../LiveContainer/utils.h"
++#import "../LiveContainer/LCSceneUtils.h"
+ #import <LocalAuthentication/LocalAuthentication.h>
+ #import "Localization.h"
+ 
+@@ -9,6 +10,38 @@ UIInterfaceOrientation LCOrientationLock = UIInterfaceOrientationUnknown;
+ NSMutableArray<NSString*>* LCSupportedUrlSchemes = nil;
+ BOOL launchURLProcessed = NO;
+ 
++// Restore touch delivery after a window focus / container switch. A guest window
++// whose scene was terminated/disconnected stays visible but receives no touches.
++// When a scene becomes active, repair only genuinely stale bindings: windows
++// with no scene, or whose scene is no longer connected. We intentionally do NOT
++// touch windows on a healthy (even background/hosted) scene — multitask guest
++// scenes are hosted and can legitimately report a background activation state.
++static void LCInstallSceneActivationObserver(void) {
++    static dispatch_once_t onceToken;
++    dispatch_once(&onceToken, ^{
++        [NSNotificationCenter.defaultCenter addObserverForName:UIScene.didActivateNotification
++                                                        object:nil
++                                                         queue:NSOperationQueue.mainQueue
++                                                    usingBlock:^(NSNotification * _Nonnull note) {
++            if (!LCForegroundActiveScene()) return;
++            NSSet *connected = UIApplication.sharedApplication.connectedScenes;
++            for (UIWindow *window in UIApplication.sharedApplication.windows) {
++                if (window.hidden) continue;
++                UIWindowScene *current = window.windowScene;
++                // Only repair a missing scene or a scene iOS has disconnected.
++                BOOL stale = !current || (current && ![connected containsObject:current]);
++                if (!stale) continue;
++                if ([window respondsToSelector:@selector(updateWindowScene)]) {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
++                    [window performSelector:@selector(updateWindowScene)];
++#pragma clang diagnostic pop
++                }
++            }
++        }];
++    });
++}
++
+ __attribute__((constructor))
+ static void UIKitGuestHooksInit() {
+     if(!NSUserDefaults.lcGuestAppId) return;
+@@ -19,6 +52,7 @@ static void UIKitGuestHooksInit() {
+     swizzle(UIApplication.class, @selector(setDelegate:), @selector(hook_setDelegate:));
+     swizzle(UIScene.class, @selector(scene:didReceiveActions:fromTransitionContext:), @selector(hook_scene:didReceiveActions:fromTransitionContext:));
+     swizzle(UIScene.class, @selector(openURL:options:completionHandler:), @selector(hook_openURL:options:completionHandler:));
++    LCInstallSceneActivationObserver();
+     NSInteger LCOrientationLockDirection = [NSUserDefaults.guestAppInfo[@"LCOrientationLock"] integerValue];
+     if(LCOrientationLockDirection != 0 && [UIDevice.currentDevice userInterfaceIdiom] == UIUserInterfaceIdiomPhone) {
+         switch (LCOrientationLockDirection) {
+@@ -129,8 +163,14 @@ void LCShowSwitchAppConfirmation(NSURL *url, NSString* bundleId, bool isSharedAp
+     }];
+     [alert addAction:cancelAction];
+     window.rootViewController = [UIViewController new];
+-    window.windowLevel = UIApplication.sharedApplication.windows.lastObject.windowLevel + 1;
+-    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
++    // Bind to the scene the user is actually looking at. Binding to an arbitrary
++    // (possibly background) scene leaves an invisible key window that swallows
++    // all touches on that scene -> "app shown but not touchable".
++    LCBindWindowToActiveScene(window);
++    // Use a fixed alert level instead of lastObject.windowLevel + 1, which
++    // escalates every time a confirmation is shown and lets one container's
++    // window permanently sit above the other container's app.
++    window.windowLevel = UIWindowLevelAlert;
+     [window makeKeyAndVisible];
+     [window.rootViewController presentViewController:alert animated:YES completion:nil];
+     objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+@@ -144,8 +184,8 @@ void LCShowAlert(NSString* message) {
+     }];
+     [alert addAction:okAction];
+     window.rootViewController = [UIViewController new];
+-    window.windowLevel = UIApplication.sharedApplication.windows.lastObject.windowLevel + 1;
+-    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
++    LCBindWindowToActiveScene(window);
++    window.windowLevel = UIWindowLevelAlert;
+     [window makeKeyAndVisible];
+     [window.rootViewController presentViewController:alert animated:YES completion:nil];
+     objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+@@ -232,12 +272,12 @@ void LCOpenWebPage(NSString* webPageUrlString, NSString* originalUrl) {
+     }];
+     [alert addAction:cancelAction];
+     window.rootViewController = [UIViewController new];
+-    window.windowLevel = UIApplication.sharedApplication.windows.lastObject.windowLevel + 1;
+-    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
++    LCBindWindowToActiveScene(window);
++    window.windowLevel = UIWindowLevelAlert;
+     [window makeKeyAndVisible];
+     [window.rootViewController presentViewController:alert animated:YES completion:nil];
+     objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+-    
++
+ 
+ }
+ 
+@@ -262,12 +302,12 @@ void LCOpenSideStoreURL(NSURL* sidestoreUrl) {
+     }];
+     [alert addAction:cancelAction];
+     window.rootViewController = [UIViewController new];
+-    window.windowLevel = UIApplication.sharedApplication.windows.lastObject.windowLevel + 1;
+-    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
++    LCBindWindowToActiveScene(window);
++    window.windowLevel = UIWindowLevelAlert;
+     [window makeKeyAndVisible];
+     [window.rootViewController presentViewController:alert animated:YES completion:nil];
+     objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+-    
++
+ }
+ 
+ void authenticateUser(void (^completion)(BOOL success, NSError *error)) {
+@@ -305,8 +345,13 @@ void handleLiveContainerLaunch(NSString* bundleName, NSString* containerFolderNa
+         NSString* runningLC = [NSClassFromString(@"LCSharedUtils") getContainerUsingLCSchemeWithFolderName:containerFolderName];
+         // the app is running in an lc, that lc is not me, also is not my avatar
+         if(runningLC) {
+-            if([runningLC hasSuffix:@"liveprocess"]) {
+-                runningLC = runningLC.stringByDeletingPathExtension;
++            // Bare `liveprocess` (multitask guest) must resolve to the host LC's
++            // own scheme, otherwise we build `liveprocess://...` which no
++            // installed LiveContainer handles and the launch silently fails.
++            runningLC = LCResolveHostLCScheme(runningLC, NSUserDefaults.lcMainBundle);
++            if(!runningLC) {
++                LCShowAppNotFoundAlert(bundleName);
++                return;
+             }
+             NSString* urlStr = [NSString stringWithFormat:@"%@://livecontainer-launch?bundle-name=%@&container-folder-name=%@", runningLC, bundleName, containerFolderName];
+             [UIApplication.sharedApplication openURL:[NSURL URLWithString:urlStr] options:@{} completionHandler:nil];
+@@ -653,7 +698,7 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
+ }
+ 
+ - (CGRect)hook_statusBarFrame {
+-    UIStatusBarManager* manager = [(UIWindowScene*)(UIApplication.sharedApplication.connectedScenes.anyObject) statusBarManager];
++    UIStatusBarManager* manager = LCForegroundActiveScene().statusBarManager;
+     if(manager) {
+         return manager.statusBarFrame;
+     } else {
+@@ -769,11 +814,26 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
+     [self hook_setHidden:hidden];
+ }
+ - (void)updateWindowScene {
+-    for(UIWindowScene *windowScene in UIApplication.sharedApplication.connectedScenes) {
+-        if(!self.windowScene && self.screen == windowScene.screen) {
+-            self.windowScene = windowScene;
+-            break;
+-        }
++    // Bind to the foreground-active scene the user is actually interacting with.
++    //
++    // The old implementation matched `self.screen == windowScene.screen` and set
++    // the scene only when `!self.windowScene`. On iPhone / single-screen iPad all
++    // UIWindowScenes share UIScreen.mainScreen, so in a multi-scene process
++    // (multitask window + main LiveContainer running at once) the window was
++    // bound to an arbitrary scene. Worse, the `!self.windowScene` guard meant the
++    // wrong binding could never be corrected, leaving the guest window on a
++    // background scene: visible but not receiving touches.
++    UIWindowScene *activeScene = LCForegroundActiveScene();
++    if (!activeScene) return;
++
++    // Re-bind when there is no scene yet, or when the current scene is no longer
++    // foreground-active (focus switched to another container/window). Do not
++    // steal a window that already sits on a different foreground-active scene.
++    if (self.windowScene == activeScene) return;
++    if (self.windowScene &&
++        self.windowScene.activationState == UISceneActivationStateForegroundActive) {
++        return;
+     }
++    self.windowScene = activeScene;
+ }
+ @end
