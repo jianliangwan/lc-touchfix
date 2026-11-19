@@ -29,13 +29,15 @@ jobs:
       # 官方源码，固定在补丁所基于的 commit，含子模块（OpenSSL / litehook）。
       - name: Checkout official source @ b7cfda6
         run: |
-          git clone --filter=blob:none https://github.com/LiveContainer/LiveContainer.git .
+          git clone --filter=blob:none https://github.com/LiveContainer/LiveContainer.git src
+          cd src
           git checkout b7cfda60c39933a94d616f2a358ac2e48fd4e5cd
           git submodule update --init --recursive
 
       - name: Apply touch-fix patch
+        working-directory: src
         run: |
-          git apply meta/livecontainer-touch-fix.patch
+          git apply ../meta/livecontainer-touch-fix.patch
           test -f LiveContainer/LCSceneUtils.h && echo "touch-fix applied OK"
 
       - name: Ensure wget
@@ -45,10 +47,12 @@ jobs:
         run: gem install xcpretty --no-document
 
       - name: Show Xcode version
+        working-directory: src
         run: xcodebuild -version
 
       # 公开 runner 无开发者证书：archive 跳过签名，最终由 ldid ad-hoc 签名。
       - name: Archive
+        working-directory: src
         run: |
           set -o pipefail
           xcodebuild archive \
@@ -62,9 +66,11 @@ jobs:
 
       # 官方打包脚本：注入 SideStore scheme/app group，dylibify SideStore，ldid 签名。
       - name: Create IPA
+        working-directory: src
         run: sh .github/build_github.sh
 
       - name: List artifacts
+        working-directory: src
         run: ls -lh *.ipa
 
       - name: Publish IPAs to release
@@ -74,5 +80,5 @@ jobs:
           name: "LiveContainer TouchFix IPA"
           body: "官方 3.8.14 (b7cfda6) + 多实例触摸修复。ad-hoc 签名，请用 SideStore/AltStore/Sideloadly 侧载安装。主 LiveContainer 与 LiveContainer2 需使用同一 IPA 重签。"
           files: |
-            LiveContainer.ipa
-            LiveContainer+SideStore.ipa
+            src/LiveContainer.ipa
+            src/LiveContainer+SideStore.ipa
